@@ -80,14 +80,9 @@ def _cmd_infer(args):
         sys.exit(1)
 
     if args.device is None:
-        if torch.cuda.is_available():
-            args.device = "cuda:0"
-        elif hasattr(torch, "xpu") and torch.xpu.is_available():
-            args.device = "xpu"
-        elif hasattr(torch, "mps") and torch.mps.is_available():
-            args.device = "mps"
-        else:
-            args.device = "cpu"
+        from indextts.utils.device import default_device
+        args.device = default_device()
+        if args.device == "cpu":
             args.fp16 = False
             print("WARNING: Running on CPU may be slow.")
 

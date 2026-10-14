@@ -4,6 +4,8 @@ import torch.utils.data
 from librosa.filters import mel as librosa_mel_fn
 from scipy.io.wavfile import read
 
+from indextts.musa_ops.real_stft import real_stft
+
 MAX_WAV_VALUE = 32768.0
 
 
@@ -59,20 +61,24 @@ def mel_spectrogram(y, n_fft, num_mels, sampling_rate, hop_size, win_size, fmin,
     )
     y = y.squeeze(1)
 
-    spec = torch.view_as_real(
-        torch.stft(
-            y,
-            n_fft,
-            hop_length=hop_size,
-            win_length=win_size,
-            window=hann_window[str(sampling_rate) + "_" + str(y.device)],
-            center=center,
-            pad_mode="reflect",
-            normalized=False,
-            onesided=True,
-            return_complex=True,
+    window = hann_window[str(sampling_rate) + "_" + str(y.device)]
+    if y.device.type == "musa" and n_fft == 1024 and win_size == 1024 and not center:
+        spec = real_stft(y, window, hop_size)
+    else:
+        spec = torch.view_as_real(
+            torch.stft(
+                y,
+                n_fft,
+                hop_length=hop_size,
+                win_length=win_size,
+                window=window,
+                center=center,
+                pad_mode="reflect",
+                normalized=False,
+                onesided=True,
+                return_complex=True,
+            )
         )
-    )
 
     spec = torch.sqrt(spec.pow(2).sum(-1) + (1e-9))
 

@@ -18,6 +18,7 @@ from indextts.gpt.perceiver import PerceiverResampler
 from indextts.utils.arch_util import AttentionBlock
 from indextts.utils.typical_sampling import TypicalLogitsWarper
 from indextts.utils.tokenizer import LANGUAGE_DICT
+from indextts.utils.device import device_count, device_type, empty_cache, set_device
 
 
 def null_position_embeddings(range, dim):
@@ -61,7 +62,7 @@ class GPT2InferenceModel(GPT2PreTrainedModel):
 
     def parallelize(self, device_map=None):
         self.device_map = (
-            get_device_map(len(self.transformer.h), range(max(1, torch.cuda.device_count())))
+            get_device_map(len(self.transformer.h), range(max(1, device_count(self.transformer.first_device if hasattr(self.transformer, "first_device") else None))))
             if device_map is None
             else device_map
         )
@@ -75,7 +76,7 @@ class GPT2InferenceModel(GPT2PreTrainedModel):
         self.transformer = self.transformer.to("cpu")
         self.lm_head = self.lm_head.to("cpu")
         self.model_parallel = False
-        torch.cuda.empty_cache()
+        empty_cache(self.transformer.first_device if hasattr(self.transformer, "first_device") else None)
         if torch.backends.mps.is_available():
             torch.mps.empty_cache()
 
@@ -177,10 +178,7 @@ class GPT2InferenceModel(GPT2PreTrainedModel):
 
         # Set device for model parallelism
         if self.model_parallel:
-            if torch.backends.mps.is_available():
-                self.to(self.transformer.first_device)
-            else:
-                torch.cuda.set_device(self.transformer.first_device)
+            set_device(self.transformer.first_device)
             hidden_states = hidden_states.to(self.lm_head.weight.device)
 
         lm_logits = self.lm_head(hidden_states)
@@ -432,7 +430,8 @@ class UnifiedVoice(nn.Module):
             use_cache=True,
         )
 
-        if self.use_accel and torch.cuda.is_available():
+        gpt_device = next(self.gpt.parameters()).device
+        if self.use_accel and device_type(gpt_device) == "cuda":
             # Check if flash attention is available
             try:
                 import flash_attn
@@ -472,14 +471,14 @@ class UnifiedVoice(nn.Module):
             self.mel_head,
             kv_cache=kv_cache,
         )
-        if use_deepspeed and half and torch.cuda.is_available():
+        if use_deepspeed and half and device_type(gpt_device) == "cuda":
             import deepspeed
             self.ds_engine = deepspeed.init_inference(model=self.inference_model,
                                                       mp_size=1,
                                                       replace_with_kernel_inject=True,
                                                       dtype=torch.float16)
             self.inference_model = self.ds_engine.module.eval()
-        elif use_deepspeed and torch.cuda.is_available():
+        elif use_deepspeed and device_type(gpt_device) == "cuda":
             import deepspeed
             self.ds_engine = deepspeed.init_inference(model=self.inference_model,
                                                       mp_size=1,

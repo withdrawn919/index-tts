@@ -1,7 +1,7 @@
 import os
 from subprocess import CalledProcessError
 
-os.environ['HF_HUB_CACHE'] = './checkpoints/hf_cache'
+os.environ.setdefault('HF_HUB_CACHE', './checkpoints/hf_cache')
 import json
 import re
 import time
@@ -25,16 +25,22 @@ from indextts.utils.front import TextNormalizer
 from indextts.utils.tokenizer import get_tokenizer, lang_to_token
 from indextts.utils.ja_g2p import JapaneseG2PProcessor
 from indextts.utils.nemo_tn import normalize_text as nemo_text_normalize
+from indextts.utils.device import default_device, empty_cache, musa_available, total_memory_gb
 
 from indextts.s2mel.modules.commons import load_checkpoint2, MyModel
 from indextts.s2mel.modules.bigvgan import bigvgan
 from indextts.s2mel.modules.campplus.DTDNN import CAMPPlus
 from indextts.s2mel.modules.audio import mel_spectrogram
+from indextts.musa_ops.fbank import musa_fbank
 from transformers import AutoTokenizer
-from modelscope import AutoModelForCausalLM
+try:
+    from modelscope import AutoModelForCausalLM
+except ImportError:
+    from transformers import AutoModelForCausalLM
 from transformers import SeamlessM4TFeatureExtractor, Wav2Vec2BertModel
 import random
 import torch.nn.functional as F
+
 
 PRONUNCIATION_ANNOTATION_PATTERN = re.compile(r'<([^|>\n]+)\|([^>\n]+)>')
 """
@@ -96,23 +102,20 @@ class IndexTTS2:
             self.device = device
             self.use_bf16 = False if device == "cpu" else use_bf16
             self.use_cuda_kernel = use_cuda_kernel is not None and use_cuda_kernel and device.startswith("cuda")
-        elif torch.cuda.is_available():
-            self.device = "cuda:0"
-            self.use_bf16 = use_bf16
-            self.use_cuda_kernel = use_cuda_kernel is None or use_cuda_kernel
-        elif hasattr(torch, "xpu") and torch.xpu.is_available():
-            self.device = "xpu"
-            self.use_bf16 = use_bf16
-            self.use_cuda_kernel = False
-        elif hasattr(torch, "mps") and torch.backends.mps.is_available():
-            self.device = "mps"
-            self.use_bf16 = False  # Use bfloat16 on MPS is overhead than float32
-            self.use_cuda_kernel = False
         else:
-            self.device = "cpu"
+            self.device = default_device()
+            self.use_bf16 = use_bf16 and self.device != "cpu"
+            self.use_cuda_kernel = use_cuda_kernel is None or use_cuda_kernel
+            if not self.device.startswith("cuda"):
+                self.use_cuda_kernel = False
+            if self.device == "mps":
+                self.use_bf16 = False
+        if self.device == "cpu":
             self.use_bf16 = False
-            self.use_cuda_kernel = False
             print(">> Be patient, it may take a while to run in CPU mode.")
+        if self.device.startswith("musa"):
+            torch.backends.mudnn.allow_tf32 = False
+            print(">> MUSA: 已关闭进程级 muDNN TF32，保持音频 FP32 运算精度")
 
         self.cfg = OmegaConf.load(cfg_path)
         self.model_dir = model_dir
@@ -123,15 +126,14 @@ class IndexTTS2:
 
         # Detect low-VRAM GPUs (< 10 GB) to enable automatic text chunking
         self.low_vram = False
-        if torch.cuda.is_available() and self.device.startswith("cuda"):
-            dev_idx = int(self.device.split(":")[-1]) if ":" in self.device else 0
-            total_vram_gb = torch.cuda.get_device_properties(dev_idx).total_memory / (1024 ** 3)
+        if self.device.startswith(("cuda", "musa")):
+            total_vram_gb = total_memory_gb(self.device)
             if total_vram_gb < 10.0:
                 self.low_vram = True
                 print(f">> Low-VRAM mode enabled ({total_vram_gb:.1f} GB < 10 GB), long text will be split into chunks")
 
         if use_qwen_emo:
-            self.qwen_emo = QwenEmotion(os.path.join(self.model_dir, self.cfg.qwen_emo_path))
+            self.qwen_emo = QwenEmotion(os.path.join(self.model_dir, self.cfg.qwen_emo_path), device=self.device)
         else:
             self.qwen_emo = None
             print(">> QwenEmotion not loaded (use_qwen_emo=False)")
@@ -623,7 +625,7 @@ class IndexTTS2:
                 self.cache_s2mel_style = None
                 self.cache_s2mel_prompt = None
                 self.cache_mel = None
-                torch.cuda.empty_cache()
+                empty_cache(self.device)
             audio, sr = self._load_and_cut_audio(spk_audio_prompt, 15, verbose)
             audio_22k = torchaudio.transforms.Resample(sr, 22050)(audio)
             audio_16k = torchaudio.transforms.Resample(sr, 16000)(audio)
@@ -637,12 +639,16 @@ class IndexTTS2:
             ref_mel = self.mel_fn(audio_22k.to(spk_cond_emb.device).float())
             ref_target_lengths = torch.LongTensor([ref_mel.size(2)]).to(ref_mel.device)
 
-            feat = torchaudio.compliance.kaldi.fbank(audio_16k.to(ref_mel.device),
-                                                    num_mel_bins=80,
-                                                    dither=0,
-                                                    sample_frequency=16000)
+            if self.device.startswith("musa"):
+                feat = musa_fbank(audio_16k.to(self.device), num_mel_bins=80,
+                                  dither=0, sample_frequency=16000)
+            else:
+                feat = torchaudio.compliance.kaldi.fbank(audio_16k.to(ref_mel.device),
+                                                        num_mel_bins=80,
+                                                        dither=0,
+                                                        sample_frequency=16000)
             feat = feat - feat.mean(dim=0, keepdim=True)  # feat2另外一个滤波器能量组特征[922, 80]
-            style = self.campplus_model(feat.unsqueeze(0))  # 参考音频的全局style2[1,192]
+            style = self.campplus_model(feat.unsqueeze(0).to(spk_cond_emb.device))  # 参考音频的全局style2[1,192]
 
             prompt_condition = self.s2mel.models['length_regulator'](
                 # S_ref,
@@ -678,7 +684,7 @@ class IndexTTS2:
         if self.cache_emo_cond is None or self.cache_emo_audio_prompt != emo_audio_prompt:
             if self.cache_emo_cond is not None:
                 self.cache_emo_cond = None
-                torch.cuda.empty_cache()
+                empty_cache(self.device)
             emo_audio, _ = self._load_and_cut_audio(emo_audio_prompt,15,verbose,sr=16000)
             emo_inputs = self.extract_features(emo_audio, sampling_rate=16000, return_tensors="pt")
             emo_input_features = emo_inputs["input_features"]
@@ -902,19 +908,28 @@ def find_most_similar_cosine(query_vector, matrix):
     query_vector = query_vector.float()
     matrix = matrix.float()
 
+    if query_vector.device.type == "musa":
+        from indextts.musa_ops.cosine import cosine_argmax
+
+        return cosine_argmax(query_vector, matrix)
     similarities = F.cosine_similarity(query_vector, matrix, dim=1)
     most_similar_index = torch.argmax(similarities)
     return most_similar_index
 
 class QwenEmotion:
-    def __init__(self, model_dir):
+    def __init__(self, model_dir, device=None):
         self.model_dir = model_dir
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_dir)
+        use_musa = device is not None and torch.device(device).type == "musa"
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_dir,
             torch_dtype="float16",  # "auto"
-            device_map="auto"
+            device_map=None if use_musa else "auto",
+            **({"attn_implementation": "eager"} if use_musa else {}),
         )
+        if use_musa:
+            self.model = self.model.to(device)
+        self.model.eval()
         self.prompt = "文本情感分类"
         self.cn_key_to_en = {
             "高兴": "happy",
@@ -1004,7 +1019,7 @@ class QwenEmotion:
 
         return emotion_dict
 
-    def inference(self, text_input):
+    def inference(self, text_input, max_new_tokens=512):
         start = time.time()
         messages = [
             {"role": "system", "content": f"{self.prompt}"},
@@ -1021,7 +1036,7 @@ class QwenEmotion:
         # conduct text completion
         generated_ids = self.model.generate(
             **model_inputs,
-            max_new_tokens=32768,
+            max_new_tokens=max_new_tokens,
             pad_token_id=self.tokenizer.eos_token_id
         )
         output_ids = generated_ids[0][len(model_inputs.input_ids[0]):].tolist()
@@ -1067,16 +1082,22 @@ if __name__ == "__main__":
     parser.add_argument("--text", type=str, default="欢迎大家来体验indextts2，并给予我们意见与反馈，谢谢大家。")
     parser.add_argument("--lang", type=str, default="ZH")
     parser.add_argument("--output", type=str, default="gen.wav")
+    parser.add_argument("--trace", type=str, default=None, help="Save a CPU and accelerator Perfetto trace")
     parser.add_argument("--text_normalization", action="store_true", default=True)
     args = parser.parse_args()
 
+    demo_device = "musa:0" if musa_available() else None
     tts = IndexTTS2(
         cfg_path=args.cfg_path,
         model_dir=args.model_dir,
+        device=demo_device,
         use_bf16=True,
         use_cuda_kernel=False,
         use_torch_compile=False,
-        use_qwen_emo=True,
+        use_qwen_emo=not (demo_device is not None and demo_device.startswith("musa")),
     )
 
-    tts.infer(spk_audio_prompt=args.prompt_wav, text=args.text, lang=args.lang, output_path=args.output, verbose=True, text_normalization=args.text_normalization)
+    from indextts.utils.profiling import inference_trace
+
+    with inference_trace(tts.device, args.trace):
+        tts.infer(spk_audio_prompt=args.prompt_wav, text=args.text, lang=args.lang, output_path=args.output, verbose=True, text_normalization=args.text_normalization)

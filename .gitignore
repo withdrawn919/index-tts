@@ -29,6 +29,11 @@ desktop.ini
 /checkpoints*/*
 !/checkpoints*/*.yaml
 /outputs/
+/musa_validation/
+/qwen_runtime/
+/.cache/
+*.perfetto.json
+*.raw.json
 
 # Example audio files (downloaded on demand, not stored in git)
 /examples/*.wav

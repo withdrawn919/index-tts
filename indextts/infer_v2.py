@@ -21,6 +21,7 @@ from indextts.codec.maskgct_codec import build_semantic_codec
 from indextts.utils.checkpoint import load_checkpoint
 from indextts.utils.common import fade_out_tail, save_pcm_wav
 from indextts.utils.front import TextNormalizer, TextTokenizer
+from indextts.utils.device import default_device, empty_cache
 
 from indextts.s2mel.modules.commons import load_checkpoint2, MyModel
 from indextts.s2mel.modules.bigvgan import bigvgan
@@ -28,7 +29,10 @@ from indextts.s2mel.modules.campplus.DTDNN import CAMPPlus
 from indextts.s2mel.modules.audio import mel_spectrogram
 
 from transformers import AutoTokenizer, SeamlessM4TFeatureExtractor, Wav2Vec2BertModel
-from modelscope import AutoModelForCausalLM
+try:
+    from modelscope import AutoModelForCausalLM
+except ImportError:
+    from transformers import AutoModelForCausalLM
 import safetensors
 import random
 import torch.nn.functional as F
@@ -64,23 +68,12 @@ class IndexTTS2:
             self.device = device
             self.use_fp16 = False if device == "cpu" else use_fp16
             self.use_cuda_kernel = use_cuda_kernel is not None and use_cuda_kernel and device.startswith("cuda")
-        elif torch.cuda.is_available():
-            self.device = "cuda:0"
-            self.use_fp16 = use_fp16
-            self.use_cuda_kernel = use_cuda_kernel is None or use_cuda_kernel
-        elif hasattr(torch, "xpu") and torch.xpu.is_available():
-            self.device = "xpu"
-            self.use_fp16 = use_fp16
-            self.use_cuda_kernel = False
-        elif hasattr(torch, "mps") and torch.backends.mps.is_available():
-            self.device = "mps"
-            self.use_fp16 = False  # Use float16 on MPS is overhead than float32
-            self.use_cuda_kernel = False
         else:
-            self.device = "cpu"
-            self.use_fp16 = False
-            self.use_cuda_kernel = False
-            print(">> Be patient, it may take a while to run in CPU mode.")
+            self.device = default_device()
+            self.use_fp16 = use_fp16 and self.device not in ("cpu", "mps")
+            self.use_cuda_kernel = self.device.startswith("cuda") and (use_cuda_kernel is None or use_cuda_kernel)
+            if self.device == "cpu":
+                print(">> Be patient, it may take a while to run in CPU mode.")
 
         self.cfg = OmegaConf.load(cfg_path)
         self.model_dir = model_dir
@@ -450,7 +443,7 @@ class IndexTTS2:
                 self.cache_s2mel_style = None
                 self.cache_s2mel_prompt = None
                 self.cache_mel = None
-                torch.cuda.empty_cache()
+                empty_cache(self.device)
             audio,sr = self._load_and_cut_audio(spk_audio_prompt,15,verbose)
             audio_22k = torchaudio.transforms.Resample(sr, 22050)(audio)
             audio_16k = torchaudio.transforms.Resample(sr, 16000)(audio)
@@ -504,7 +497,7 @@ class IndexTTS2:
         if self.cache_emo_cond is None or self.cache_emo_audio_prompt != emo_audio_prompt:
             if self.cache_emo_cond is not None:
                 self.cache_emo_cond = None
-                torch.cuda.empty_cache()
+                empty_cache(self.device)
             emo_audio, _ = self._load_and_cut_audio(emo_audio_prompt,15,verbose,sr=16000)
             emo_inputs = self.extract_features(emo_audio, sampling_rate=16000, return_tensors="pt")
             emo_input_features = emo_inputs["input_features"]

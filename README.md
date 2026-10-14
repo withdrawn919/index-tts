@@ -216,6 +216,98 @@ PYTHONPATH="$PYTHONPATH:." uv run indextts/infer_v2_5.py \
   --lang EN
 ```
 
+#### MUSA
+
+IndexTTS-2.5 automatically selects `musa:0` when a MUSA device is available.
+With a compatible PyTorch/torch_musa and MUSA Toolkit installation, run the native
+demo without the CUDA-only BigVGAN extension:
+
+```bash
+PYTHONPATH=. python3 indextts/infer_v2_5.py \
+  --cfg_path checkpoints/config.yaml \
+  --model_dir checkpoints \
+  --prompt_wav examples/voice_01.wav \
+  --text "欢迎体验 IndexTTS 2.5 的 MUSA 适配。" \
+  --lang ZH \
+  --output outputs/index_tts_2_5_musa.wav \
+  --trace outputs/traces/normal.cpu_musa.json
+```
+
+模型、semantic codec、s2mel 和 BigVGAN 的张量计算运行在 MUSA。
+BigVGAN 是神经声码器模型，不是算子库；其 CUDA 专用激活扩展改用 MUSA
+支持的 PyTorch 实现。音频解码、重采样、文本处理和上游 Hugging Face
+feature extractor 仍保留原有 CPU 路径，不能将它们称为全 GPU 推理。
+
+参考 mel 和 CAMPPlus fbank 不再回退到 CPU FFT：
+
+- `indextts/musa_ops/real_stft.mu`：MUSA C++ 1024/512 点实数 FFT。
+- `indextts/musa_ops/real_stft.cpp`：PrivateUse1 注册、参数检查和当前流启动。
+- `indextts/musa_ops/fbank.py`：16 kHz、25 ms 窗、10 ms 步长、dither=0 的
+  Kaldi fbank；输入相关运算均在 MUSA，静态窗/滤波系数首次生成后缓存。
+- `indextts/infer_v2_5.py`：通过实际设备分支接入，未修改全局 `torch.fft`。
+
+首次运行只编译 native 算子扩展，不运行 TorchInductor；构建目录可用
+`INDEXTTS_MUSA_BUILD_DIR` 指定，默认在 `$XDG_CACHE_HOME/indextts/musa_ops`
+（未设置时使用 `~/.cache/indextts/musa_ops`）。编译架构由 torch_musa 根据可见设备
+推导，也可用 `TORCH_MUSA_ARCH_LIST` 指定。需要选择卡时自行设置
+`MUSA_VISIBLE_DEVICES`；文档不包含测试机器的物理卡号或具体型号。
+Triton 缓存沿用其默认设置，也可用 `TRITON_CACHE_DIR` 覆盖。
+标准推理路径已验证 v2.5；QwenEmotion 的隔离运行方式见下文，DeepSpeed 和 CUDA
+加速引擎尚未验证。
+v2.5 初始化时将 `torch.backends.mudnn.allow_tf32` 设为 `False`，这是进程级设置：
+GPT 的显式 BF16 不变，其余 FP32 算子不使用 TF32。不要在同一进程的其它线程中
+切回 TF32；BigVGAN 的 CPU 对拍显示，开启 TF32 会明显放大波形误差。
+
+复现精度、冷数据性能、GPU trace 和 demo：
+
+```bash
+PYTHONPATH=. OMP_NUM_THREADS=4 \
+  python3 -m pytest -q tests/test_musa_audio.py
+PYTHONPATH=. OMP_NUM_THREADS=4 \
+  python3 -u tools/validate_musa_audio.py \
+  --model-dir checkpoints --output-dir outputs/musa_validation/new_run --demo
+```
+
+以 CPU PyTorch STFT / torchaudio Kaldi fbank 为基线，不以另一份 MUSA 结果充当基线。
+FFT 测试门限为 `atol=4e-5, rtol=3e-5`；特征测试为 `atol=2e-3, rtol=1e-4`。
+工具默认关闭 muDNN TF32，与 v2.5 模型一致；`--allow-tf32` 仅用于独立算子诊断，
+不能与 `--demo` 同用。开启 TF32 会使 mel/fbank 的均值误差约为 `7e-4`，
+且 BigVGAN 在参考音频 mel 上出现约 5.33% 相对 L2 误差，故不作为默认方案。
+性能脚本固定 CPU 4 线程，交替计时，每次用 CPU 128 MiB / GPU 256 MiB
+缓冲区冲刷缓存，排除冲刷与首次编译耗时，MUSA 使用同步墙钟；分别报告
+设备驻留输入和包含 H2D 的结果。输出包含逐次计时、精度结果、完整与 GPU-only trace。
+新采集的 `.raw.json` 同时保留 CPU 算子、输入形状、运行时调用和 MUSA kernel，
+`.gpu.json` 仅为额外过滤视图；历史 GPU-only 采集无法补回未记录的 CPU 算子。
+正常推理入口 `indextts/infer_v2_5.py --trace <路径>` 直接保存完整 CPU+MUSA trace，
+不跑算子验证或性能循环；不指定 `--trace` 时不启用 profiler。
+这些算子/特征提取加速比不能直接视为端到端 TTS 加速比。
+
+模型权重、配置和分词器文件放在 `--model-dir` 指定的目录。
+生成音频、验证结果和 trace 放在独立输出目录；不要将模型、构建缓存或原始
+trace 提交到版本库。原始 trace 可能包含设备属性、本机路径和进程信息，
+公开前需单独审查脱敏。
+
+`tools/validate_musa_modules.py --output-dir <目录>` 进一步使用相同权重和真实
+参考音频验证 CPU/MUSA CAMPPlus、BigVGAN，并单独隔离 fbank 替换对 CAMPPlus
+输出的影响。模块诊断门限为有限输出、相对 L2 不超过 1%、余弦相似度不低于
+0.9999；它不替代语音主观质量和全模型一致性验收。
+
+MUSA 情感提示词生成使用 `tools/generate_emotional_voice.py`：参考音频控制音色，
+`--emotion-text` 经 QwenEmotion 转成情感向量后传给 TTS。两阶段均在 MUSA，
+情绪混合强度由 `--emotion-weight` 控制，不代表数学上完全消除参考音频的情绪。
+已验证的 TTS 环境使用 Transformers 4.50.2，而 Qwen3 需要更新版本；为避免影响
+的 TTS，`tools/classify_musa_emotion.py` 在子进程中使用独立的 Transformers 4.52.1。
+通过必填的 `--emotion-runtime <依赖目录>` 指定隔离依赖，系统版本保持不变。
+可用 `python3 -m pip install --target ./qwen_runtime --no-deps transformers==4.52.1
+tokenizers==0.21.4` 准备该目录；其余依赖沿用已安装的 TTS 环境。
+情感向量检索缺失的余弦范数路径由 `indextts/musa_ops/cosine.py` 融合实现，已通过
+24 项 CPU argmax 对拍测试；尚未将该小算子作为独立性能优化验收。
+
+`--seconds` 是合成后的时长校准，不是模型原生的精确时长控制：先用
+`--duration-factor` 合成，再用 CPU librosa 保持音高的时间拉伸输出目标时长，
+同时保留 `.raw.wav` 和 JSON 参数记录。这个入口生成情感语音，**不能保证歌唱，
+不生成旋律和伴奏**；输入文本通过 `--text-file` 指定。
+
 The default `--prompt_wav` lives in `examples/`, which is populated the first
 time the WebUI starts. To fetch it without the WebUI:
 

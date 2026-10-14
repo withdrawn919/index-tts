@@ -11,6 +11,7 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
 import pandas as pd
+from indextts.utils.device import bf16_supported, default_device, total_memory_gb
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(current_dir)
@@ -115,19 +116,45 @@ ensure_examples_available()
 LOW_VRAM_THRESHOLD_GB = 10.0
 
 
-def detect_vram_gb():
-    import torch
+def detect_device():
+    return default_device()
 
-    if not torch.cuda.is_available():
-        return None
-    return torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+
+def detect_vram_gb():
+    device = detect_device()
+    memory = total_memory_gb(device)
+    return memory if memory else None
+
+
+DEVICE = detect_device()
+IS_MUSA = DEVICE.startswith("musa")
+
+
+def device_supports_bf16(device):
+    return bf16_supported(device)
+
+
+def device_supports_cuda_extensions(device):
+    return device.startswith("cuda")
+
+
+def device_supports_qwen(device):
+    return not device.startswith("musa")
+
+
+def device_supports_torch_compile(device):
+    return not device.startswith("musa")
+
+
+if IS_MUSA:
+    print(">> MUSA device detected; CUDA-only kernels and CUDA-specific accelerators are disabled.")
 
 
 _vram_gb = detect_vram_gb()
 LOW_VRAM = _vram_gb is not None and _vram_gb < LOW_VRAM_THRESHOLD_GB
 
 HALF_PRECISION = cmd_args.fp16 or LOW_VRAM
-LOAD_QWEN_EMO = cmd_args.qwen_emo or not LOW_VRAM
+LOAD_QWEN_EMO = (cmd_args.qwen_emo or not LOW_VRAM) and device_supports_qwen(DEVICE)
 
 if LOW_VRAM:
     print(
@@ -146,14 +173,15 @@ def build_tts(use_accel=False, use_torch_compile=False):
     kwargs = dict(
         model_dir=cmd_args.model_dir,
         cfg_path=os.path.join(cmd_args.model_dir, "config.yaml"),
-        use_deepspeed=cmd_args.deepspeed,
-        use_cuda_kernel=cmd_args.cuda_kernel,
-        use_accel=use_accel,
-        use_torch_compile=use_torch_compile,
+        device=DEVICE,
+        use_deepspeed=cmd_args.deepspeed and not IS_MUSA,
+        use_cuda_kernel=cmd_args.cuda_kernel and device_supports_cuda_extensions(DEVICE),
+        use_accel=use_accel and device_supports_cuda_extensions(DEVICE),
+        use_torch_compile=use_torch_compile and device_supports_torch_compile(DEVICE),
         use_qwen_emo=LOAD_QWEN_EMO,
     )
     if IS_V25:
-        use_bf16 = HALF_PRECISION and torch.cuda.is_bf16_supported()
+        use_bf16 = (HALF_PRECISION or IS_MUSA) and device_supports_bf16(DEVICE)
         if HALF_PRECISION and not use_bf16:
             print(">> BF16 is not supported on this device, falling back to full precision.")
         kwargs["use_bf16"] = use_bf16

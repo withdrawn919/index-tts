@@ -155,7 +155,7 @@ def _build_parser():
     check.add_argument(
         "--device",
         default=None,
-        help="Required runtime device, e.g. cpu, cuda, cuda:0, mps or xpu",
+        help="Required runtime device, e.g. cpu, musa, musa:0, cuda:0, mps or xpu",
     )
     batch = subparsers.add_parser(
         "batch",
@@ -1610,6 +1610,7 @@ def _import_required_packages():
 
 def _detect_devices(torch_module):
     return {
+        "musa": _is_available(torch_module, "musa"),
         "cuda": _is_available(torch_module, "cuda"),
         "xpu": _is_available(torch_module, "xpu"),
         "mps": _is_mps_available(torch_module),
@@ -1634,7 +1635,7 @@ def _is_requested_device_available(torch_module, devices, device):
     family = _device_family(device)
     if not devices.get(family, False):
         return False
-    if family in {"cuda", "xpu"}:
+    if family in {"cuda", "musa", "xpu"}:
         index = _device_index(device, family)
         if index is None:
             return True
@@ -1667,6 +1668,8 @@ def _indexed_device_available(torch_module, family, index):
 def _device_family(device):
     if device == "cuda" or device.startswith("cuda:"):
         return "cuda"
+    if device == "musa" or device.startswith("musa:"):
+        return "musa"
     if device == "xpu" or device.startswith("xpu:"):
         return "xpu"
     if device == "mps":

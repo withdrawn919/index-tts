@@ -23,6 +23,7 @@ from indextts.utils.common import fade_out_tail, save_pcm_wav
 from indextts.utils.feature_extractors import MelSpectrogramFeatures
 
 from indextts.utils.front import TextNormalizer, TextTokenizer
+from indextts.utils.device import default_device, empty_cache
 
 
 class IndexTTS:
@@ -42,23 +43,12 @@ class IndexTTS:
             self.device = device
             self.use_fp16 = False if device == "cpu" else use_fp16
             self.use_cuda_kernel = use_cuda_kernel is not None and use_cuda_kernel and device.startswith("cuda")
-        elif torch.cuda.is_available():
-            self.device = "cuda:0"
-            self.use_fp16 = use_fp16
-            self.use_cuda_kernel = use_cuda_kernel is None or use_cuda_kernel
-        elif hasattr(torch, "xpu") and torch.xpu.is_available():
-            self.device = "xpu"
-            self.use_fp16 = use_fp16
-            self.use_cuda_kernel = False
-        elif hasattr(torch, "mps") and torch.backends.mps.is_available():
-            self.device = "mps"
-            self.use_fp16 = False  # Use float16 on MPS is overhead than float32
-            self.use_cuda_kernel = False
         else:
-            self.device = "cpu"
-            self.use_fp16 = False
-            self.use_cuda_kernel = False
-            print(">> Be patient, it may take a while to run in CPU mode.")
+            self.device = default_device()
+            self.use_fp16 = use_fp16 and self.device not in ("cpu", "mps")
+            self.use_cuda_kernel = self.device.startswith("cuda") and (use_cuda_kernel is None or use_cuda_kernel)
+            if self.device == "cpu":
+                print(">> Be patient, it may take a while to run in CPU mode.")
 
         self.cfg = OmegaConf.load(cfg_path)
         self.model_dir = model_dir
@@ -270,7 +260,7 @@ class IndexTTS:
     def torch_empty_cache(self):
         try:
             if "cuda" in str(self.device):
-                torch.cuda.empty_cache()
+                empty_cache(self.device)
             elif "mps" in str(self.device):
                 torch.mps.empty_cache()
         except Exception as e:
